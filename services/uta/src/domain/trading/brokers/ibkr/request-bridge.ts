@@ -25,6 +25,7 @@ import {
   type OrderState,
   type EClient,
   type TickAttrib,
+  type BarData,
 } from '@traderalice/ibkr'
 import { BrokerError, type BrokerConnectionStateEvent } from '../types.js'
 import { classifyIbkrError } from './ibkr-contracts.js'
@@ -61,8 +62,37 @@ interface CurrentTimeWaiter {
 const CURRENT_TIME_REPLY_GRACE_MS = 30_000
 
 const DEFAULT_TIMEOUT_MS = 10_000
+/**
+ * Historical bars come from the HMDS farm, not the trading socket, and a year
+ * of 1-minute bars outruns the ordinary 10s budget.
+ */
+const HISTORICAL_TIMEOUT_MS = 30_000
 const SNAPSHOT_TIMEOUT_MS = 12_500
 const ACCOUNT_READY_TIMEOUT_MS = 20_000
+
+/**
+ * How long an `Inactive` status is parked before it is accepted as the answer.
+ * TWS uses `Inactive` for both a reject and a legitimate hold, so the window
+ * lets a reject's `error()` arrive first.
+ */
+const INACTIVE_GRACE_MS = 1_500
+
+const acceptsLiveStatus = (status: string): boolean => status !== 'Inactive'
+
+/**
+ * A cancel must not be completed by `Submitted`/`Filled`/`PreSubmitted`, or a
+ * fill that beat the cancel is recorded as a cancel.
+ */
+const CANCEL_CONFIRMING_STATUSES = new Set(['Cancelled', 'ApiCancelled', 'PendingCancel'])
+export const acceptsCancelStatus = (status: string): boolean =>
+  CANCEL_CONFIRMING_STATUSES.has(status)
+
+interface PendingOrderRequest extends PendingRequest<CollectedOpenOrder> {
+  /** Which callback status completes this request. */
+  accepts: (status: string) => boolean
+  /** Deferred `Inactive` answer, resolved if nothing better arrives. */
+  hold?: { value: CollectedOpenOrder; timer: ReturnType<typeof setTimeout> }
+}
 
 export class RequestBridge extends DefaultEWrapper {
   // ---- State ----
@@ -80,7 +110,7 @@ export class RequestBridge extends DefaultEWrapper {
   private snapshotResolveOnBidAsk = new Set<number>()
 
   // ---- Mode B: orderId-based pending requests ----
-  private orderPending = new Map<number, PendingRequest<CollectedOpenOrder>>()
+  private orderPending = new Map<number, PendingOrderRequest>()
 
   // ---- Mode C: single-flight batch collectors ----
   // One in-flight sweep per kind, joined by every concurrent caller. Each
@@ -260,16 +290,31 @@ export class RequestBridge extends DefaultEWrapper {
     return this.request<TickSnapshot>(reqId, timeoutMs)
   }
 
+  /**
+   * Registers a historical-bar request. An empty result set is a legitimate
+   * answer, so the collector resolves with `[]` rather than timing out.
+   */
+  requestHistoricalBars(reqId: number, timeoutMs = HISTORICAL_TIMEOUT_MS): Promise<BarData[]> {
+    return this.requestCollector<BarData>(reqId, timeoutMs)
+  }
+
   // ---- Mode B: orderId-based requests ----
 
-  /** Register a pending order request (waits for openOrder callback). */
-  requestOrder(orderId: number, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<CollectedOpenOrder> {
+  /**
+   * Registers a pending order request. Cancels must pass `acceptsCancelStatus`
+   * so a fill cannot be mistaken for a cancel.
+   */
+  requestOrder(
+    orderId: number,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    accepts: (status: string) => boolean = acceptsLiveStatus,
+  ): Promise<CollectedOpenOrder> {
     return new Promise<CollectedOpenOrder>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.orderPending.delete(orderId)
+        this.clearOrderPending(orderId)
         reject(new BrokerError('NETWORK', `Order ${orderId} timed out after ${timeoutMs}ms`))
       }, timeoutMs)
-      this.orderPending.set(orderId, { resolve, reject, timer })
+      this.orderPending.set(orderId, { resolve, reject, timer, accepts })
     })
   }
 
@@ -471,20 +516,41 @@ export class RequestBridge extends DefaultEWrapper {
     this.resolveRequest(reqId, this.collectors.get(reqId) ?? [])
   }
 
-  private resolveOrderRequest(orderId: number, value: CollectedOpenOrder): void {
+  /** Drop a pending order request and every timer it owns. */
+  private clearOrderPending(orderId: number): PendingOrderRequest | undefined {
     const entry = this.orderPending.get(orderId)
-    if (!entry) return
+    if (!entry) return undefined
     clearTimeout(entry.timer)
+    if (entry.hold) clearTimeout(entry.hold.timer)
     this.orderPending.delete(orderId)
-    entry.resolve(value)
+    return entry
+  }
+
+  private resolveOrderRequest(orderId: number, value: CollectedOpenOrder): void {
+    this.clearOrderPending(orderId)?.resolve(value)
   }
 
   private rejectOrderRequest(orderId: number, error: Error): void {
+    this.clearOrderPending(orderId)?.reject(error)
+  }
+
+  /**
+   * Routes an openOrder / orderStatus answer to its pending request. An
+   * `Inactive` status is parked for `INACTIVE_GRACE_MS` so a reject's `error()`
+   * or a later live status can win.
+   */
+  private answerOrderRequest(orderId: number, value: CollectedOpenOrder): void {
     const entry = this.orderPending.get(orderId)
     if (!entry) return
-    clearTimeout(entry.timer)
-    this.orderPending.delete(orderId)
-    entry.reject(error)
+    if (entry.accepts(value.orderState.status)) {
+      this.resolveOrderRequest(orderId, value)
+      return
+    }
+    if (value.orderState.status !== 'Inactive' || entry.hold) return
+    entry.hold = {
+      value,
+      timer: setTimeout(() => this.resolveOrderRequest(orderId, value), INACTIVE_GRACE_MS),
+    }
   }
 
   private rejectAll(error: Error): void {
@@ -499,6 +565,7 @@ export class RequestBridge extends DefaultEWrapper {
 
     for (const [, entry] of this.orderPending) {
       clearTimeout(entry.timer)
+      if (entry.hold) clearTimeout(entry.hold.timer)
       entry.reject(error)
     }
     this.orderPending.clear()
@@ -646,6 +713,16 @@ export class RequestBridge extends DefaultEWrapper {
   }
 
   override contractDetailsEnd(reqId: number): void {
+    this.resolveCollector(reqId)
+  }
+
+  // ---- Historical bars (collector) ----
+
+  override historicalData(reqId: number, bar: BarData): void {
+    this.pushCollector(reqId, bar)
+  }
+
+  override historicalDataEnd(reqId: number, _start: string, _end: string): void {
     this.resolveCollector(reqId)
   }
 
@@ -854,10 +931,7 @@ export class RequestBridge extends DefaultEWrapper {
     this.noteInbound()
     const collected: CollectedOpenOrder = { contract, order, orderState }
 
-    // Route to pending order request (placeOrder/modifyOrder)
-    if (this.orderPending.has(orderId)) {
-      this.resolveOrderRequest(orderId, collected)
-    }
+    this.answerOrderRequest(orderId, collected)
 
     // Also collect for openOrders batch
     this.openOrdersBatch?.orders.push(collected)
@@ -881,16 +955,15 @@ export class RequestBridge extends DefaultEWrapper {
       this.fillData_.set(orderId, { filled, avgFillPrice })
     }
 
-    // For cancel requests, we wait for status 'Cancelled'
-    if (this.orderPending.has(orderId) && status === 'Cancelled') {
-      const os = new OrderStateClass()
-      os.status = 'Cancelled'
-      this.resolveOrderRequest(orderId, {
-        contract: new ContractClass(),
-        order: new OrderClass(),
-        orderState: os,
-      })
-    }
+    if (!this.orderPending.has(orderId)) return
+
+    const os = new OrderStateClass()
+    os.status = status
+    this.answerOrderRequest(orderId, {
+      contract: new ContractClass(),
+      order: new OrderClass(),
+      orderState: os,
+    })
   }
 
   override openOrderEnd(): void {

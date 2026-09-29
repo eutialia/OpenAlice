@@ -14,6 +14,8 @@ import type { EngineContext } from '../../core/types.js'
 import type { BarSourceRef, GetBarsOpts } from '../../domain/market-data/bars/index.js'
 import type { AssetClass } from '../../domain/market-data/aggregate-search.js'
 
+const BAR_SESSIONS = ['regular', 'extended'] as const
+
 export function createBarsRoutes(ctx: EngineContext): Hono {
   const app = new Hono()
 
@@ -28,7 +30,7 @@ export function createBarsRoutes(ctx: EngineContext): Hono {
     return c.json({ candidates, count: candidates.length })
   })
 
-  // GET /api/bars?barId=&interval=&count=&start=&end=&assetClass=
+  // GET /api/bars?barId=&interval=&count=&start=&end=&assetClass=&session=
   //  or ?symbol=&assetClass=&interval=  (vendor-default, when no barId chosen yet)
   app.get('/', async (c) => {
     const interval = c.req.query('interval') ?? '1d'
@@ -39,6 +41,11 @@ export function createBarsRoutes(ctx: EngineContext): Hono {
     const start = c.req.query('start')
     const end = c.req.query('end')
     const asOf = c.req.query('asOf')
+    const sessionParam = c.req.query('session')
+    const session = BAR_SESSIONS.find((value) => value === sessionParam)
+    if (sessionParam && !session) {
+      return c.json({ results: null, meta: null, error: "session must be 'regular' or 'extended'" }, 400)
+    }
 
     let ref: BarSourceRef
     if (barId) ref = assetClass ? { barId, assetClass } : { barId }
@@ -50,6 +57,7 @@ export function createBarsRoutes(ctx: EngineContext): Hono {
     if (start) opts.start = start
     if (end) opts.end = end
     if (asOf) opts.asOf = asOf
+    if (session) opts.session = session
 
     try {
       const { bars, meta } = await ctx.barService.getBars(ref, opts)

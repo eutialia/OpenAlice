@@ -283,8 +283,11 @@ export function createBarService(deps: BarServiceDeps): BarService {
       start: start ? new Date(start) : undefined,
       end: (opts.end ?? opts.asOf) ? new Date(`${opts.end ?? opts.asOf}T23:59:59.999Z`) : undefined,
       limit: opts.count,
+      ...(opts.session ? { session: opts.session } : {}),
     }
-    const wireBars = await acct.getHistorical({ aliceId: barId }, params)
+    // UTA reports the session it actually served, so a consumer can tell a
+    // regular series from a continuous one.
+    const { bars: wireBars, session, forced } = await acct.getHistorical({ aliceId: barId }, params)
     const bounded = wireBars.map((b) => barToOhlcv(b, params.interval)).filter((bar) =>
       (!opts.start || bar.date.slice(0, 10) >= opts.start) &&
       (!(opts.end ?? opts.asOf) || bar.date.slice(0, 10) <= (opts.end ?? opts.asOf)!))
@@ -302,6 +305,8 @@ export function createBarService(deps: BarServiceDeps): BarService {
         sourceId,
         barId,
         barCapability: effectiveCap,
+        ...(session ? { session } : {}),
+        ...(forced ? { sessionForced: true } : {}),
         ...computeFreshness(bars[bars.length - 1]?.date ?? '', opts, () => new Date(), bars[0]?.date ?? '', effectiveCap),
       }),
     }

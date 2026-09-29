@@ -12,11 +12,27 @@ import { Contract, Order, ContractDescription, ContractDetails, UNSET_DECIMAL, U
 import { BrokerError, type IBroker, type AccountInfo, type Position, type OpenOrder, type PlaceOrderResult, type Quote, type MarketClock, type AccountCapabilities, type BrokerHealth, type BrokerHealthInfo, type BrokerConnectionStateEvent, type UTAReach, type UTATier, type TpSlParams, type Bar, type BarParams, type ExpandContractFilters, type ContractExpansion, type SubAccountRef } from './brokers/types.js'
 
 const REACH_RANK: Record<UTAReach, number> = { down: 0, connected: 1, readable: 2 }
+
+/**
+ * Broker statuses that mean "still working", which sync keeps in the pending
+ * lane. `Inactive` is a held order and `PendingCancel` an unconfirmed cancel;
+ * only `Cancelled` / `ApiCancelled` are terminal.
+ */
+const WORKING_ORDER_STATUSES = new Set([
+  'Submitted',
+  'PreSubmitted',
+  'PendingSubmit',
+  'PendingCancel',
+  'ApiPending',
+  'Inactive',
+])
 import { TradingGit } from './git/TradingGit.js'
 import { recomputeCostBasisFromCommits } from './cost-basis.js'
 import { projectOrderHistory, projectTradeHistory } from './order-history.js'
-import type { OrderHistoryEntry, TradeHistoryEntry } from '@traderalice/uta-protocol'
+import type { OrderHistoryEntry, TradeHistoryEntry, HistoricalBarsResult } from '@traderalice/uta-protocol'
 import { pnlOf } from './position-math.js'
+import { resolveBarSession } from './bar-session.js'
+import { assertOcaType, parseOrderLinkId } from './oca.js'
 import type {
   Operation,
   AddResult,
@@ -181,7 +197,9 @@ export class UnifiedTradingAccount {
         unrealizedPnL: accountInfo.unrealizedPnL,
         realizedPnL: accountInfo.realizedPnL ?? '0',
         positions,
-        pendingOrders: orders.filter(o => o.orderState.status === 'Submitted' || o.orderState.status === 'PreSubmitted'),
+        // Must stay the same predicate as sync: an order pending in one lane
+        // and terminal in the other can never be reconciled.
+        pendingOrders: orders.filter(o => WORKING_ORDER_STATUSES.has(o.orderState.status)),
       }
     }
 
@@ -771,8 +789,9 @@ export class UnifiedTradingAccount {
     if (params.trailingPercent != null) order.trailingPercent = new Decimal(String(params.trailingPercent))
     if (params.goodTillDate != null) order.goodTillDate = params.goodTillDate
     if (params.outsideRth) order.outsideRth = true
-    if (params.parentId != null) order.parentId = parseInt(params.parentId, 10) || 0
+    if (params.parentId != null) order.parentId = parseOrderLinkId(params.parentId, 'placeOrder')
     if (params.ocaGroup != null) order.ocaGroup = params.ocaGroup
+    if (params.ocaType != null) order.ocaType = assertOcaType(params.ocaType)
 
     const tpsl: TpSlParams | undefined =
       (params.takeProfit || params.stopLoss)
@@ -793,6 +812,13 @@ export class UnifiedTradingAccount {
     if (params.orderType != null) changes.orderType = params.orderType
     if (params.tif != null) changes.tif = params.tif
     if (params.goodTillDate != null) changes.goodTillDate = params.goodTillDate
+    // Plain scalars, so they survive the toWire → commit.json → rehydrate
+    // round-trip unchanged.
+    if (params.ocaGroup != null) changes.ocaGroup = params.ocaGroup
+    if (params.ocaType != null) changes.ocaType = assertOcaType(params.ocaType)
+    if (params.parentId != null) {
+      changes.parentId = parseOrderLinkId(params.parentId, 'modifyOrder')
+    }
 
     return this.git.add({ action: 'modifyOrder', orderId: params.orderId, changes })
   }
@@ -930,7 +956,7 @@ export class UnifiedTradingAccount {
       if (!brokerOrder) continue
 
       const status = brokerOrder.orderState.status
-      if (status !== 'Submitted' && status !== 'PreSubmitted') {
+      if (!WORKING_ORDER_STATUSES.has(status)) {
         // Extract fill data when available — `.toFixed()` (not
         // `.toNumber()`) so sub-satoshi qty (OKX-style accounting)
         // round-trips into the persisted git operation record without
@@ -941,7 +967,9 @@ export class UnifiedTradingAccount {
           : undefined
 
         const currentStatus =
-          status === 'Filled' ? 'filled' : status === 'Cancelled' ? 'cancelled' : 'rejected'
+          status === 'Filled' ? 'filled'
+          : status === 'Cancelled' || status === 'ApiCancelled' ? 'cancelled'
+          : 'rejected'
         if (currentStatus === 'filled' && (!filledQty || !brokerOrder.avgFillPrice)) {
           // Loud, not fatal: a fill without qty/price still advances the
           // state machine, but cost-basis reconstruction downstream will be
@@ -1199,13 +1227,22 @@ export class UnifiedTradingAccount {
    * the broker has no `getHistorical`. Expands an aliceId-only stub to a
    * trade-ready contract first, same as getQuote. Bars carry no contract, so
    * there is no return-side aliceId stamping — the caller already holds it.
+   *
+   * The session is resolved here rather than in the adapter, and the result
+   * carries the effective `session` plus `forced`.
    */
-  async getHistorical(contract: Contract, params: BarParams): Promise<Bar[]> {
+  async getHistorical(contract: Contract, params: BarParams): Promise<HistoricalBarsResult> {
     if (typeof this.broker.getHistorical !== 'function') {
       throw new BrokerError('CONFIG', `Account "${this.label}" does not support historical bars.`)
     }
     const resolved = this._expandAliceIdIfNeeded(contract)
-    return this._callBroker(() => this.broker.getHistorical!(resolved, params))
+    const { session, forced } = resolveBarSession(
+      resolved.secType,
+      params.session,
+      this.getCapabilities().historicalBars,
+    )
+    const bars = await this._callBroker(() => this.broker.getHistorical!(resolved, { ...params, session }))
+    return { bars, session, forced }
   }
 
   getMarketClock(): Promise<MarketClock> {

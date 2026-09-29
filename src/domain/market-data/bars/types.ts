@@ -19,7 +19,7 @@ import type { BarFreshness } from './freshness.js'
  * structurally-identical `OhlcvData`/`DataSourceMeta` for free.
  */
 
-import type { Bar, BarParams, ContractSearchHit } from '@traderalice/uta-protocol'
+import type { BarParams, BarSession, ContractSearchHit, HistoricalBarsResult } from '@traderalice/uta-protocol'
 import type { AssetClass, MarketSearchDeps } from '../aggregate-search.js'
 import type {
   EquityClientLike,
@@ -96,6 +96,12 @@ export interface BarMeta {
   isLatestActual?: boolean
   /** Weekday gap to `asOf`, ignoring exchange holidays and session hours. */
   staleTradingDays?: number
+  // ---- session contract (broker sources only) ----
+  /** Which trading session these bars actually cover. Absent for vendor feeds,
+   *  which expose no session filter. */
+  session?: BarSession
+  /** True when the requested session could not be honored. */
+  sessionForced?: boolean
 }
 
 export interface BarSourceCandidate {
@@ -128,6 +134,9 @@ export interface GetBarsOpts {
   end?: string
   /** Point-in-time anchor for `count` (alias of `end`; default now). */
   asOf?: string
+  /** Trading session for broker (UTA) sources; vendor sources ignore it. Omit
+   *  to take the per-instrument default. */
+  session?: BarSession
 }
 
 /**
@@ -148,7 +157,7 @@ export interface BarService {
 
 /** Minimal broker-bar account surface (UTAAccountSDK satisfies it structurally). */
 export interface UtaBarAccount {
-  getHistorical(query: { aliceId?: string }, params: BarParams): Promise<Bar[]>
+  getHistorical(query: { aliceId?: string }, params: BarParams): Promise<HistoricalBarsResult>
 }
 
 /** Minimal broker-bar gateway (UTAManagerSDK satisfies it structurally). */

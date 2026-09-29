@@ -149,11 +149,16 @@ describe('Alpaca single-leg options execution', () => {
     { totalQuantity: new Decimal('0.5') }, { totalQuantity: new Decimal(0) },
     { totalQuantity: new Decimal(-1) }, { cashQty: new Decimal(100) },
     { tif: 'IOC' }, { outsideRth: true }, { orderType: 'TRAIL' },
-    { trailingPercent: new Decimal(1) }, { parentId: 1 }, { ocaGroup: 'group' },
+    { trailingPercent: new Decimal(1) },
     { trailStopPrice: new Decimal(1) }, { goodTillDate: '20260918' },
   ])('rejects unsupported option fields before dispatch: %j', async changes => {
     const { broker, client, contract } = setup()
     expect((await broker.placeOrder(contract, Object.assign(order(), changes))).success).toBe(false)
+    expect(client.createOrder).not.toHaveBeenCalled()
+  })
+  it.each([{ parentId: 1 }, { ocaGroup: 'group' }])('refuses option linkage fields before dispatch: %j', async changes => {
+    const { broker, client, contract } = setup()
+    await expect(broker.placeOrder(contract, Object.assign(order(), changes))).rejects.toThrow(/One-Cancels-All/)
     expect(client.createOrder).not.toHaveBeenCalled()
   })
   it('fails closed when the account lookup fails or reports a block', async () => {

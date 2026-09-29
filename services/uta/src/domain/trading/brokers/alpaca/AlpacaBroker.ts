@@ -30,6 +30,7 @@ import {
   type ExpandContractFilters,
   type ContractExpansion,
 } from '../types.js'
+import { refuseOcaLinkage } from '../../oca.js'
 import '../../contract-ext.js'
 import type {
   AlpacaBrokerConfig,
@@ -297,7 +298,7 @@ export class AlpacaBroker implements IBroker {
   private validateOptionOrder(order: Partial<Order>, tpsl?: TpSlParams, amendment = false): string | undefined {
     if ((!amendment || order.orderType) && !['MKT', 'LMT', 'STP', 'STP LMT'].includes(order.orderType ?? '')) return 'Alpaca single-leg options support MKT, LMT, STP and STP LMT only.'
     if ((!amendment || order.tif) && !['DAY', 'GTC'].includes(order.tif ?? 'DAY')) return 'Alpaca options require DAY or GTC time in force.'
-    if (order.parentId || order.ocaGroup || order.goodTillDate || (order.trailStopPrice != null && !order.trailStopPrice.equals(UNSET_DECIMAL))) return 'Alpaca options do not support parent/OCA, GTD or trailing-stop fields.'
+    if (order.goodTillDate || (order.trailStopPrice != null && !order.trailStopPrice.equals(UNSET_DECIMAL))) return 'Alpaca options do not support GTD or trailing-stop fields.'
     const qty = order.totalQuantity
     if ((!amendment || (qty != null && !qty.equals(UNSET_DECIMAL))) && (!qty || qty.equals(UNSET_DECIMAL) || !qty.isFinite() || !qty.isInteger() || qty.lte(0))) return 'Alpaca options require a positive whole number of contracts.'
     if (order.cashQty != null && !order.cashQty.equals(UNSET_DECIMAL)) return 'Alpaca options do not support cash-notional orders.'
@@ -314,6 +315,7 @@ export class AlpacaBroker implements IBroker {
   // ---- Trading operations ----
 
   async placeOrder(contract: Contract, order: Order, tpsl?: TpSlParams): Promise<PlaceOrderResult> {
+    refuseOcaLinkage('Alpaca', order)
     const symbol = this.canonicalSymbol(contract)
     if (!symbol) {
       return { success: false, error: 'Cannot resolve contract to Alpaca symbol' }
@@ -404,6 +406,7 @@ export class AlpacaBroker implements IBroker {
   }
 
   async modifyOrder(orderId: string, changes: Partial<Order>): Promise<PlaceOrderResult> {
+    refuseOcaLinkage('Alpaca', changes)
     try {
       const existing = await this.client.getOrder(orderId) as AlpacaOrderRaw
       const contract = this.contractFor(existing.symbol, existing.asset_class)
@@ -636,6 +639,9 @@ export class AlpacaBroker implements IBroker {
    * capability quality 'iex'; full SIP needs a paid data subscription.
    */
   async getHistorical(contract: Contract, params: BarParams): Promise<Bar[]> {
+    // `params.session` is ignored: getBarsV2 has no RTH filter, so the feed is
+    // always the continuous tape (the capability declares no `sessions`, and
+    // UTA marks such a read forced).
     const symbol = this.canonicalSymbol(contract)
     if (!symbol) throw new BrokerError('EXCHANGE', 'Cannot resolve contract to Alpaca symbol')
     const resolved = this.contractFor(symbol)
