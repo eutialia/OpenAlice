@@ -8,6 +8,10 @@
 data
 logs
 *.log
+# Sibling compose services keep their own state outside the server image.
+# The Neko Chromium profile is hundreds of MB and is not an OpenAlice build input.
+neko/profile
+ib-gateway-settings
 
 # Build artifacts (we rebuild inside the image)
 dist
